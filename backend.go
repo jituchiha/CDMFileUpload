@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sync"
 
+	"github.com/joho/godotenv"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
@@ -24,105 +24,69 @@ const (
 )
 
 var (
-	config    *oauth2.Config
-	authState = &struct {
-		authorized bool
-		mu         sync.Mutex
-	}{authorized: false}
+	driveService *drive.Service
 )
 
 func init() {
-	b, err := os.ReadFile("credentials.json")
+	// Load .env file
+	err := godotenv.Load()
 	if err != nil {
-		log.Fatalf("Unable to read client secret file: %v", err)
+		log.Fatal("Error loading .env file")
 	}
 
-	config, err = google.ConfigFromJSON(b, drive.DriveFileScope)
+	ctx := context.Background()
+	credJSON := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	if credJSON == "" {
+		log.Fatal("GOOGLE_APPLICATION_CREDENTIALS not set in .env file")
+	}
+
+	config, err := google.ConfigFromJSON([]byte(credJSON), drive.DriveFileScope)
 	if err != nil {
 		log.Fatalf("Unable to parse client secret file to config: %v", err)
 	}
 
-	// Set the correct redirect URL
-	config.RedirectURL = "http://localhost:8081/oauth2callback"
+	client := getClient(config)
 
-	// Print the redirect URL for debugging
-	fmt.Printf("Redirect URL set to: %s\n", config.RedirectURL)
-
-	// Check if token file exists
-	if _, err := os.Stat(tokenFile); err == nil {
-		authState.authorized = true
+	driveService, err = drive.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		log.Fatalf("Unable to retrieve Drive client: %v", err)
 	}
 }
 
 func main() {
-	http.HandleFunc("/", serveHTML)
-	http.HandleFunc("/get-auth-url", getAuthURL)
-	http.HandleFunc("/check-auth-status", checkAuthStatus)
-	http.HandleFunc("/oauth2callback", handleOAuth2Callback)
-	http.HandleFunc("/upload", uploadHandler)
+	http.HandleFunc("/upload", corsMiddleware(uploadHandler))
 
-	fmt.Println("Server is running on http://localhost:8081")
-	log.Fatal(http.ListenAndServe("0.0.0.0:8081", nil))
-}
-
-func serveHTML(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, "index.html")
-}
-
-func getAuthURL(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
-	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-	fmt.Printf("Generated Auth URL: %s\n", authURL) // Print the generated URL for debugging
-	json.NewEncoder(w).Encode(map[string]string{"url": authURL})
-}
-
-func checkAuthStatus(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
-	authState.mu.Lock()
-	defer authState.mu.Unlock()
-	json.NewEncoder(w).Encode(map[string]bool{"authorized": authState.authorized})
-}
-
-func handleOAuth2Callback(w http.ResponseWriter, r *http.Request) {
-	fmt.Printf("Received callback request: %s\n", r.URL.String()) // Print the received callback URL for debugging
-	state := r.URL.Query().Get("state")
-	if state != "state-token" {
-		http.Error(w, "Invalid state parameter", http.StatusBadRequest)
-		return
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8081"
 	}
 
-	code := r.URL.Query().Get("code")
-	tok, err := config.Exchange(context.Background(), code)
-	if err != nil {
-		http.Error(w, "Unable to retrieve token from web", http.StatusInternalServerError)
-		return
+	fmt.Printf("Server is running on http://localhost:%s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
 	}
-
-	saveToken(tokenFile, tok)
-	authState.mu.Lock()
-	authState.authorized = true
-	authState.mu.Unlock()
-
-	fmt.Fprintf(w, "Authorization successful! You can close this window and return to the application.")
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
-	if r.Method != "POST" {
+	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	authState.mu.Lock()
-	authorized := authState.authorized
-	authState.mu.Unlock()
-
-	if !authorized {
-		http.Error(w, "Not authorized. Please authorize the application first.", http.StatusUnauthorized)
-		return
-	}
-
-	r.ParseMultipartForm(10 << 20)
+	r.ParseMultipartForm(maxFileSizeBytes)
 	file, handler, err := r.FormFile("uploadfile")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -130,9 +94,8 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	err = os.MkdirAll(uploadPath, os.ModePerm)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if handler.Size > maxFileSizeBytes {
+		http.Error(w, "File too large", http.StatusBadRequest)
 		return
 	}
 
@@ -142,20 +105,13 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tempFile.Close()
-	defer os.Remove(tempFile.Name()) // Clean up the temp file after we're done
+	defer os.Remove(tempFile.Name())
 
-	fileBytes, err := io.ReadAll(file)
+	_, err = io.Copy(tempFile, file)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	if len(fileBytes) > maxFileSizeBytes {
-		http.Error(w, "File too large", http.StatusBadRequest)
-		return
-	}
-
-	tempFile.Write(fileBytes)
 
 	err = uploadFileToDrive(tempFile.Name())
 	if err != nil {
@@ -163,21 +119,11 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Successfully Uploaded File: %s", handler.Filename)
 }
 
 func uploadFileToDrive(filePath string) error {
-	ctx := context.Background()
-	client, err := getClient(config)
-	if err != nil {
-		return fmt.Errorf("unable to get client: %v", err)
-	}
-
-	srv, err := drive.NewService(ctx, option.WithHTTPClient(client))
-	if err != nil {
-		return fmt.Errorf("unable to retrieve Drive client: %v", err)
-	}
-
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("unable to open file: %v", err)
@@ -192,7 +138,7 @@ func uploadFileToDrive(filePath string) error {
 	fileMetadata := &drive.File{
 		Name: filepath.Base(filePath),
 	}
-	res, err := srv.Files.Create(fileMetadata).Media(file).Do()
+	res, err := driveService.Files.Create(fileMetadata).Media(file).Do()
 	if err != nil {
 		return fmt.Errorf("unable to create file: %v", err)
 	}
@@ -201,14 +147,36 @@ func uploadFileToDrive(filePath string) error {
 	return nil
 }
 
-func getClient(config *oauth2.Config) (*http.Client, error) {
-	tok, err := tokenFromFile(tokenFile)
+// Retrieve a token, saves the token, then returns the generated client.
+func getClient(config *oauth2.Config) *http.Client {
+	tokFile := tokenFile
+	tok, err := tokenFromFile(tokFile)
 	if err != nil {
-		return nil, fmt.Errorf("token not found or invalid: %v", err)
+		tok = getTokenFromWeb(config)
+		saveToken(tokFile, tok)
 	}
-	return config.Client(context.Background(), tok), nil
+	return config.Client(context.Background(), tok)
 }
 
+// Request a token from the web, then returns the retrieved token.
+func getTokenFromWeb(config *oauth2.Config) *oauth2.Token {
+	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
+	fmt.Printf("Go to the following link in your browser then type the "+
+		"authorization code: \n%v\n", authURL)
+
+	var authCode string
+	if _, err := fmt.Scan(&authCode); err != nil {
+		log.Fatalf("Unable to read authorization code: %v", err)
+	}
+
+	tok, err := config.Exchange(context.TODO(), authCode)
+	if err != nil {
+		log.Fatalf("Unable to retrieve token from web: %v", err)
+	}
+	return tok
+}
+
+// Retrieves a token from a local file.
 func tokenFromFile(file string) (*oauth2.Token, error) {
 	f, err := os.Open(file)
 	if err != nil {
@@ -220,6 +188,7 @@ func tokenFromFile(file string) (*oauth2.Token, error) {
 	return tok, err
 }
 
+// Saves a token to a file path.
 func saveToken(path string, token *oauth2.Token) {
 	fmt.Printf("Saving credential file to: %s\n", path)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
@@ -228,10 +197,4 @@ func saveToken(path string, token *oauth2.Token) {
 	}
 	defer f.Close()
 	json.NewEncoder(f).Encode(token)
-}
-
-func enableCors(w *http.ResponseWriter) {
-	(*w).Header().Set("Access-Control-Allow-Origin", "*")
-	(*w).Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-	(*w).Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
 }

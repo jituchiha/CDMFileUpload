@@ -1,5 +1,3 @@
-
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -28,7 +26,7 @@
         input[type="file"] {
             margin-bottom: 1rem;
         }
-        input[type="submit"], button {
+        input[type="submit"] {
             background-color: #4CAF50;
             border: none;
             color: white;
@@ -41,82 +39,51 @@
             cursor: pointer;
             border-radius: 4px;
         }
+        #status {
+            margin-top: 1rem;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
     <div class="upload-container">
         <h1>Upload File to Google Drive</h1>
-        <button id="authorize-button">Authorize Google Drive</button>
-        <form id="upload-form" enctype="multipart/form-data" style="display:none;">
-            <input type="file" name="uploadfile" id="file-input" />
+        <form id="upload-form" enctype="multipart/form-data">
+            <input type="file" name="uploadfile" id="file-input" required />
             <input type="submit" value="Upload" />
         </form>
+        <div id="status"></div>
     </div>
 
     <script>
-        const authorizeButton = document.getElementById('authorize-button');
         const uploadForm = document.getElementById('upload-form');
-
-        function checkAuthStatus() {
-            fetch('http://localhost:8081/check-auth-status')
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error('Network response was not ok');
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    if (data.authorized) {
-                        authorizeButton.style.display = 'none';
-                        uploadForm.style.display = 'block';
-                    } else {
-                        authorizeButton.style.display = 'block';
-                        uploadForm.style.display = 'none';
-                    }
-                })
-                .catch(error => console.error('Error:', error));
-        }
-
-        authorizeButton.addEventListener('click', () => {
-            fetch('http://localhost:8081/get-auth-url')
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error('Network response was not ok');
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    const authWindow = window.open(data.url, '_blank');
-                    const checkInterval = setInterval(() => {
-                        if (authWindow.closed) {
-                            clearInterval(checkInterval);
-                            checkAuthStatus();
-                        }
-                    }, 500);
-                })
-                .catch(error => console.error('Error:', error));
-        });
+        const statusDiv = document.getElementById('status');
 
         uploadForm.addEventListener('submit', (e) => {
             e.preventDefault();
             const formData = new FormData(uploadForm);
-            fetch('http://localhost:8081/upload', {
+            
+            statusDiv.textContent = 'Uploading...';
+            
+            fetch('/upload', {
                 method: 'POST',
                 body: formData
             })
-            .then(response => response.text())
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('Network response was not ok');
+                }
+                return response.text();
+            })
             .then(result => {
-                alert(result);
+                statusDiv.textContent = result;
                 document.getElementById('file-input').value = '';
             })
             .catch(error => {
                 console.error('Error:', error);
-                alert('Upload failed. Please try again.');
+                statusDiv.textContent = 'Upload failed. Please try again.';
             });
         });
-
-        // Check auth status on page load
-        checkAuthStatus();
     </script>
 </body>
 </html>
